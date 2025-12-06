@@ -23,3 +23,9 @@ void sgemm_gpu_cublas(int N, float* A, float* B, float* C);
 void sgemm_gpu_naive_device(int N, float* d_A, float* d_B, float* d_C);
 void sgemm_gpu_shared_device(int N, float* d_A, float* d_B, float* d_C);
 void sgemm_gpu_cublas_device(int N, float* d_A, float* d_B, float* d_C);
+
+void sgemm_gpu_vectorized_device(int N, float* d_A, float* d_B, float* d_C);
+
+//void sgemm_gpu_shared_float4_device(int N, float* d_A, float* d_B, float* d_C);
+
+void sgemm_gpu_2d_tiled_device(int N, float* d_A, float* d_B, float* d_C);

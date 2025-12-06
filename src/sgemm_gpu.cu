@@ -264,3 +264,178 @@ void sgemm_gpu_cublas_device(int N, float* d_A, float* d_B, float* d_C) {
     // 这里不需要 DeviceSynchronize，因为 benchmark 主程序会做
     cublasDestroy(handle);
 }
+
+
+// =========================================================
+// Kernel 3: Vectorized Memory Access (float4)
+// =========================================================
+
+// 强制将 float* 转换为 float4* 读取
+__global__ void sgemm_vectorized_kernel(int N, float* A, float* B, float* C) {
+    // 这里的 x 代表“向量”的坐标，每个 x 处理 4 个 float
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // col 是向量索引
+
+    // 实际的列坐标需要 x4
+    int actual_col = col * 4;
+
+    if (row < N && actual_col < N) {
+        // Cvalue 用 float4 来存，一次算 4 个结果
+        float4 c_res = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+        for (int k = 0; k < N; ++k) {
+            float a_val = A[row * N + k]; // A 还是一个一个读
+
+            // B 一次读 4 个！ (关键优化)
+            // 我们要求 N 是 4 的倍数，且 B 的地址对齐
+            float4 b_val = reinterpret_cast<float4*>(&B[k * N + actual_col])[0];
+
+            // 手动展开计算 4 个点
+            c_res.x += a_val * b_val.x;
+            c_res.y += a_val * b_val.y;
+            c_res.z += a_val * b_val.z;
+            c_res.w += a_val * b_val.w;
+        }
+
+        // 结果一次性写回 4 个
+        reinterpret_cast<float4*>(&C[row * N + actual_col])[0] = c_res;
+    }
+}
+
+// Host 函数
+void sgemm_gpu_vectorized_device(int N, float* d_A, float* d_B, float* d_C) {
+    // Block 还是 32x32，但 x 维度只需要原来的 1/4
+    dim3 threadsPerBlock(32 / 4, 32); 
+    dim3 numBlocks((N / 4 + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (N + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    
+    sgemm_vectorized_kernel<<<numBlocks, threadsPerBlock>>>(N, d_A, d_B, d_C);
+}
+
+
+// =========================================================
+// Kernel 5: 2D Register Tiling (终极优化)
+// =========================================================
+
+// 设定块大小参数
+// BM, BN: 一个 Block 计算 C 的 128x128 区域
+// BK: K 维度每次切分 8
+// TM, TN: 每个线程计算 C 的 8x8 区域
+const int BM = 128;
+const int BN = 128;
+const int BK = 8;
+const int TM = 8;
+const int TN = 8;
+
+__global__ void sgemm_2d_register_tiling_kernel(int N, float* A, float* B, float* C) {
+    // 1. 线程与块坐标
+    const int bx = blockIdx.x;
+    const int by = blockIdx.y;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    
+    // 线程在 Block 内的线性 ID (0 ~ 255)
+    const int tid = ty * blockDim.x + tx;
+
+    // 2. 声明 Shared Memory
+    // As: [2][BK][BM] -> 使用双缓冲思路防止 Bank Conflict (这里简化为单缓冲但转置存储)
+    // 为了避免 Bank Conflict，我们通常会把 shared memory 设大一点或者转置
+    // 这里采用简单方案：As[BK][BM], Bs[BK][BN]
+    // 实际上对于 BM=128，需要很大的 Shared Mem。
+    // 注意：4060 的 Shared Memory 足够大 (48KB/Block 以上)。
+    __shared__ float As[BK][BM]; 
+    __shared__ float Bs[BK][BN];
+
+    // 3. 声明寄存器 (Register File)
+    // 每个线程负责 8x8 的累加结果，这 64 个 float 必须完全驻留在寄存器中
+    float threadResults[TM][TN] = {0.0f};
+
+    // 4. 寄存器缓存，用于从 Shared Mem 读取数据
+    float regM[TM] = {0.0f};
+    float regN[TN] = {0.0f};
+
+    // 5. 计算加载 Global Memory 的索引
+    // 我们需要由 256 个线程 (16x16) 协作搬运 A (128x8) 和 B (8x128)
+    
+    // A_row, A_col: 当前线程负责搬运 A 的哪个点
+    // A 是 128行 x 8列。总共 1024 个元素。
+    // 线程数 256。每个线程搬运 4 个 float。
+    // 使用 float4 搬运！
+    const int load_a_row = tid / 2; // 0~127
+    const int load_a_col = (tid % 2) * 4; // 0, 4
+
+    // B_row, B_col: 当前线程负责搬运 B 的哪个点
+    // B 是 8行 x 128列。总共 1024 个元素。
+    // 每个线程搬运 4 个。
+    const int load_b_row = tid / 32; // 0~7
+    const int load_b_col = (tid % 32) * 4; // 0, 4, ..., 124
+
+    // 大循环：遍历 K 维度
+    for (int ph = 0; ph < N; ph += BK) {
+        // --- 1. 协作加载 Global -> Shared ---
+        
+        // 加载 A (转置存入 Shared Mem 以优化读取) -> As[col][row]
+        // 使用 float4 向量化加载
+        float4 vecA = reinterpret_cast<float4*>(&A[(by * BM + load_a_row) * N + (ph + load_a_col)])[0];
+        As[load_a_col][load_a_row] = vecA.x;
+        As[load_a_col+1][load_a_row] = vecA.y;
+        As[load_a_col+2][load_a_row] = vecA.z;
+        As[load_a_col+3][load_a_row] = vecA.w;
+
+        // 加载 B -> Bs[row][col]
+        float4 vecB = reinterpret_cast<float4*>(&B[(ph + load_b_row) * N + (bx * BN + load_b_col)])[0];
+        Bs[load_b_row][load_b_col] = vecB.x;
+        Bs[load_b_row][load_b_col+1] = vecB.y;
+        Bs[load_b_row][load_b_col+2] = vecB.z;
+        Bs[load_b_row][load_b_col+3] = vecB.w;
+
+        __syncthreads();
+
+        // --- 2. 核心计算 (寄存器级 GEMM) ---
+        // 外层循环：在 Shared Memory 的 BK 维度上迭代 (0~7)
+        for (int k = 0; k < BK; ++k) {
+            // 将 Shared Memory 的数据预加载到寄存器
+            // 这一步极大减少了 Shared Memory 的访问压力
+            for (int m = 0; m < TM; ++m) {
+                regM[m] = As[k][ty * TM + m];
+            }
+            for (int n = 0; n < TN; ++n) {
+                regN[n] = Bs[k][tx * TN + n];
+            }
+
+            // 外积计算 (Outer Product)
+            // 8x8 = 64 次乘加，纯寄存器操作，极快！
+            for (int m = 0; m < TM; ++m) {
+                for (int n = 0; n < TN; ++n) {
+                    threadResults[m][n] += regM[m] * regN[n];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // --- 3. 写回结果 ---
+    // 每个线程负责写回 C 的 8x8 区域
+    // 这一步不需要极致优化，因为它在 Kernel 结束时只执行一次
+    for (int m = 0; m < TM; ++m) {
+        for (int n = 0; n < TN; ++n) {
+             int c_row = by * BM + ty * TM + m;
+             int c_col = bx * BN + tx * TN + n;
+             if (c_row < N && c_col < N) {
+                 C[c_row * N + c_col] = threadResults[m][n];
+             }
+        }
+    }
+}
+
+// Host 调用
+void sgemm_gpu_2d_tiled_device(int N, float* d_A, float* d_B, float* d_C) {
+    // 这里的 BlockSize 是线程数的维度
+    // 我们用 16x16 = 256 个线程
+    // 每个线程算 8x8，所以一个 Block 算 (16*8) x (16*8) = 128x128
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks(N / 128, N / 128); // 假设 N 是 128 的倍数
+
+    sgemm_2d_register_tiling_kernel<<<numBlocks, threadsPerBlock>>>(N, d_A, d_B, d_C);
+}

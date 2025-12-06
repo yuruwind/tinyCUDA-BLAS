@@ -99,6 +99,8 @@ int main() {
         run_gpu_benchmark(N, "CUDA Naive", sgemm_gpu_naive_device);
         run_gpu_benchmark(N, "CUDA Shared", sgemm_gpu_shared_device);
         run_gpu_benchmark(N, "cuBLAS", sgemm_gpu_cublas_device);
+        run_gpu_benchmark(N, "CUDA Float4", sgemm_gpu_vectorized_device);
+        run_gpu_benchmark(N, "CUDA 2D-Reg", sgemm_gpu_2d_tiled_device);
         std::cout << "-------------------------------------------------------------------\n";
     }
 
