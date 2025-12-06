@@ -11,3 +11,6 @@ void sgemm_cpu_avx2(int N, float* A, float* B, float* C);
 
 // Cache Blocking + AVX2 版本 (挑战版)
 void sgemm_cpu_block(int N, float* A, float* B, float* C);
+
+// GPU 版本声明
+void sgemm_gpu_naive(int N, float* A, float* B, float* C);

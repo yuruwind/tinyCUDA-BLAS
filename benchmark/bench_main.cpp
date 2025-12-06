@@ -68,7 +68,11 @@ int main() {
         // 3. 运行 AVX2 Optimized
         run_benchmark_for_version(N, A.data(), B.data(), C.data(), "AVX2", sgemm_cpu_avx2);
 
-        run_benchmark_for_version(N, A.data(), B.data(), C.data(), "Blocked AVX2", sgemm_cpu_block);
+        //run_benchmark_for_version(N, A.data(), B.data(), C.data(), "Blocked AVX2", sgemm_cpu_block);
+
+        // 4. 运行 CUDA Naive
+        // 注意：第一次运行 CUDA 可能稍慢（初始化 Context），是正常的
+        run_benchmark_for_version(N, A.data(), B.data(), C.data(), "CUDA Naive", sgemm_gpu_naive);
     }
 
     return 0;
