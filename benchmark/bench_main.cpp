@@ -2,53 +2,92 @@
 #include <vector>
 #include <chrono>
 #include <iomanip>
-#include <cmath> // For std::abs
-#include <algorithm> // For std::fill
+#include <cuda_runtime.h>
+#include "sgemm.h"
 
-// 引入我们的库头文件
-#include "sgemm.h" 
+// 定义 GPU 函数指针类型
+using gemm_gpu_func = void (*)(int, float*, float*, float*);
 
-// 定义一个函数指针类型，用于指向不同的GEMM实现
-using gemm_func = void (*)(int, float*, float*, float*);
+// 宏：检查 CUDA 错误
+#define CHECK_CUDA(func) \
+{ \
+    cudaError_t status = (func); \
+    if (status != cudaSuccess) { \
+        std::cerr << "CUDA Error: " << cudaGetErrorString(status) << std::endl; \
+        exit(EXIT_FAILURE); \
+    } \
+}
 
-/**
- * 运行并测试一个GEMM版本
- */
-void run_benchmark_for_version(
-    int N, 
-    float* A, 
-    float* B, 
-    float* C, 
-    const std::string& version_name, 
-    gemm_func func
-) {
-    // ⚠️ 每次运行前必须清零 C，因为 i-k-j 顺序是累加操作！
-    // 假设 C 的大小是 N*N
-    std::fill(C, C + N * N, 0.0f); 
+// 专门测试 GPU Kernel 的函数
+void run_gpu_benchmark(int N, const std::string& name, gemm_gpu_func func) {
+    size_t bytes = N * N * sizeof(float);
 
-    auto start = std::chrono::high_resolution_clock::now();
-    func(N, A, B, C); // 调用传入的函数
-    auto end = std::chrono::high_resolution_clock::now();
+    // 1. 准备数据 (在 Host)
+    std::vector<float> h_A(N * N, 1.0f);
+    std::vector<float> h_B(N * N, 1.0f);
+    std::vector<float> h_C(N * N, 0.0f);
+
+    // 2. 分配显存 (在 Device) - 这部分时间不计入 GFLOPS
+    float *d_A, *d_B, *d_C;
+    CHECK_CUDA(cudaMalloc(&d_A, bytes));
+    CHECK_CUDA(cudaMalloc(&d_B, bytes));
+    CHECK_CUDA(cudaMalloc(&d_C, bytes));
+
+    // 3. 搬运数据 - 这部分时间也不计入
+    CHECK_CUDA(cudaMemcpy(d_A, h_A.data(), bytes, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), bytes, cudaMemcpyHostToDevice));
+
+    // 4. 预热 (Warmup) - 让 GPU 从休眠态唤醒，初始化 Cache
+    func(N, d_A, d_B, d_C);
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // 5. 正式计时 (使用 CUDA Event，比 CPU 计时更准)
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // 记录开始
+    cudaEventRecord(start);
+
+    // 运行 Kernel (这里只跑一次，如果要更稳可以跑 10 次取平均)
+    int iterations = (N <= 1024) ? 10 : 1; // 小矩阵多跑几次
+    for(int i=0; i<iterations; i++) {
+        func(N, d_A, d_B, d_C);
+    }
+
+    // 记录结束
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
     
-    std::chrono::duration<double, std::milli> duration = end - start;
+    // 计算平均时间
+    double avg_time_ms = milliseconds / iterations;
 
-    // FLOPS = 2 * N^3
+    // 6. 计算性能
     double ops = 2.0 * N * N * N;
-    double gflops = (ops / (duration.count() * 1e-3)) / 1e9;
+    double gflops = (ops / (avg_time_ms * 1e-3)) / 1e9;
 
-    // 打印结果
     std::cout << std::left << std::setw(10) << N 
-              << std::setw(15) << version_name
-              << std::setw(15) << duration.count() 
+              << std::setw(15) << name
+              << std::setw(15) << avg_time_ms 
               << std::setw(15) << gflops << "\n";
+
+    // 清理
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }
 
 int main() {
-    std::vector<int> sizes = {64, 128, 256, 512, 1024};
-    
-    // ------------------- 表头 ---------------------
-    std::cout << "\n-------------------------------------------------------------------\n";
-    std::cout << "Running AVX2 Optimization Benchmark\n";
+    // 我们主要关注大矩阵，因为小矩阵 GPU 跑不满
+    std::vector<int> sizes = {1024, 2048, 4096}; 
+
+    std::cout << "-------------------------------------------------------------------\n";
+    std::cout << "Running GPU Kernel Benchmark (Excluding PCI-e Transfer Time)\n";
     std::cout << "-------------------------------------------------------------------\n";
     std::cout << std::left << std::setw(10) << "Size" 
               << std::setw(15) << "Version"
@@ -57,22 +96,10 @@ int main() {
     std::cout << "-------------------------------------------------------------------\n";
 
     for (int N : sizes) {
-        // 1. 准备数据 (A, B, C 只需要准备一次)
-        std::vector<float> A(N * N, 1.0f);
-        std::vector<float> B(N * N, 1.0f);
-        std::vector<float> C(N * N, 0.0f); // C 每次运行前都会被 run_benchmark_for_version 清零
-
-        // 2. 运行 Reordered Naive (i-k-j)
-        run_benchmark_for_version(N, A.data(), B.data(), C.data(), "Reordered", sgemm_cpu_naive);
-
-        // 3. 运行 AVX2 Optimized
-        run_benchmark_for_version(N, A.data(), B.data(), C.data(), "AVX2", sgemm_cpu_avx2);
-
-        //run_benchmark_for_version(N, A.data(), B.data(), C.data(), "Blocked AVX2", sgemm_cpu_block);
-
-        // 4. 运行 CUDA Naive
-        // 注意：第一次运行 CUDA 可能稍慢（初始化 Context），是正常的
-        run_benchmark_for_version(N, A.data(), B.data(), C.data(), "CUDA Naive", sgemm_gpu_naive);
+        run_gpu_benchmark(N, "CUDA Naive", sgemm_gpu_naive_device);
+        run_gpu_benchmark(N, "CUDA Shared", sgemm_gpu_shared_device);
+        run_gpu_benchmark(N, "cuBLAS", sgemm_gpu_cublas_device);
+        std::cout << "-------------------------------------------------------------------\n";
     }
 
     return 0;

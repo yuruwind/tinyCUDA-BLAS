@@ -18,9 +18,12 @@ find_package(OpenMP REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(OPENBLAS REQUIRED openblas)
 
+find_package(CUDAToolkit REQUIRED) # 确保这一行在(openmp)
+
 # 头文件路径
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${OPENBLAS_INCLUDE_DIRS})
+include_directories(${CUDAToolkit_INCLUDE_DIRS})
 
 # 1. 核心库
 add_library(tinycuda_blas 
@@ -28,7 +31,8 @@ add_library(tinycuda_blas
     src/sgemm_gpu.cu
 )
 # 链接 OpenMP
-target_link_libraries(tinycuda_blas PRIVATE OpenMP::OpenMP_CXX)
+
+target_link_libraries(tinycuda_blas PRIVATE OpenMP::OpenMP_CXX CUDA::cublas)
 
 # 2. Benchmark 可执行文件
 add_executable(run_bench benchmark/bench_main.cpp)
