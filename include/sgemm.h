@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstddef> // for size_t
+#include <cuda_fp16.h>
 
 // 基础版本 (你现在的 i-k-j)
 void sgemm_cpu_naive(int N, float* A, float* B, float* C);
@@ -29,3 +30,14 @@ void sgemm_gpu_vectorized_device(int N, float* d_A, float* d_B, float* d_C);
 //void sgemm_gpu_shared_float4_device(int N, float* d_A, float* d_B, float* d_C);
 
 void sgemm_gpu_2d_tiled_device(int N, float* d_A, float* d_B, float* d_C);
+
+void sgemm_gpu_fused_relu_device(int N, float* d_A, float* d_B, float* d_C);
+
+// 3. 独立的 ReLU
+void relu_gpu_standalone_device(int N, float* d_C);
+
+// 增加带 Bias 的版本
+void sgemm_gpu_fused_bias_relu_device(int N, float* d_A, float* d_B, float* d_bias, float* d_C);
+
+// Tensor Core 纯计算接口（输入为 half，输出为 float）
+void sgemm_gpu_tensor_core_device(int N, const __half* d_A, const __half* d_B, float* d_C);

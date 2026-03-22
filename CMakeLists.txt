@@ -29,6 +29,8 @@ include_directories(${CUDAToolkit_INCLUDE_DIRS})
 add_library(tinycuda_blas 
     src/sgemm_cpu.cpp 
     src/sgemm_gpu.cu
+    src/Operator_Fusion.cu
+        src/TensorCore.cu
 )
 # 链接 OpenMP
 
